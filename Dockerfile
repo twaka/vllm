@@ -87,6 +87,29 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     pip cache remove vllm_nccl*
 #################### EXTENSION Build IMAGE ####################
 
+#################### DeepSpeed Build IMAGE ####################
+FROM dev AS build-deepspeed
+
+RUN git clone https://github.com/microsoft/DeepSpeed.git -b v0.14.2
+WORKDIR /workspace/DeepSpeed
+
+# workaround the issue https://github.com/microsoft/DeepSpeed/issues/5535
+RUN mv csrc/fp_quantizer/quantize.cu csrc/fp_quantizer/quantize_kernel.cu
+RUN sed -i -e 's/quantize.cu/quantize_kernel.cu/g' op_builder/fp_quantizer.py
+
+# relax restrictions (not examined in detail)
+RUN sed -i -e 's/8/7/g' op_builder/fp_quantizer.py
+RUN sed -i -e 's/assert input.dtype == torch.bfloat16/# assert input.dtype == torch.bfloat16/g' deepspeed/ops/fp_quantizer/quantize.py
+
+# build wheel
+RUN DS_ACCELERATOR=cuda DS_SKIP_CUDA_CHECK=1 DS_BUILD_FP_QUANTIZER=1 python3 setup.py build_ext -j2 bdist_wheel
+
+# save the nvcc version for cuda base image
+RUN echo "#!/usr/bin/env bash\ncat << EOS" > dist/nvcc_version
+RUN nvcc -V >> dist/nvcc_version
+RUN echo "EOS" >> dist/nvcc_version
+#################### DeepSpeed Build IMAGE ####################
+
 #################### vLLM installation IMAGE ####################
 # image with vLLM installed
 FROM nvidia/cuda:12.4.1-base-ubuntu22.04 AS vllm-base
@@ -105,6 +128,17 @@ RUN ldconfig /usr/local/cuda-12.4/compat/
 RUN --mount=type=bind,from=build,src=/workspace/dist,target=/vllm-workspace/dist \
     --mount=type=cache,target=/root/.cache/pip \
     pip install dist/*.whl --verbose
+
+# install deepspeed wheel
+RUN --mount=type=bind,from=build-deepspeed,src=/workspace/DeepSpeed/dist,target=/vllm-workspace/deepspeed-dist \
+    --mount=type=cache,target=/root/.cache/pip \
+    pip install deepspeed-dist/*.whl --verbose
+
+# mimic nvcc -V because deepspeed requires it to obtain the cuda version
+RUN mkdir /usr/local/cuda/bin
+RUN --mount=type=bind,from=build-deepspeed,src=/workspace/DeepSpeed/dist,target=/vllm-workspace/deepspeed-dist \
+    cp deepspeed-dist/nvcc_version /usr/local/cuda/bin/nvcc
+RUN chmod +x /usr/local/cuda/bin/nvcc
 #################### vLLM installation IMAGE ####################
 
 
